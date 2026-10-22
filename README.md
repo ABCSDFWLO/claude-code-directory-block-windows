@@ -28,6 +28,7 @@ Claude ──(Bash/PowerShell/Read/Write/Edit/Glob/Grep 호출)──▶ PreTool
 | 실행되는 파일의 내용 | `powershell -File x.ps1`, `.\x.ps1`, `python x.py`, `./deploy`, `npm run x`(package.json), `make`(Makefile) |
 | 중첩·인코딩 | `bash -c "..."`, `cmd /c "..."`, `python -c "..."`, heredoc, `powershell -EncodedCommand <base64>`, `base64 -d` 파이프 |
 | 파일 도구 | `Read`/`Write`/`Edit`/`NotebookEdit`의 경로, 제한 경로로 내려가는 `Glob`, 상위 디렉토리를 훑는 `Grep` |
+| 파일 이름 패턴 (`.env`, `*.pem` …) | 어느 폴더에 있든 `cat .env`, `type config\prod.env`, `cat config/*`, `source .env`, `python -c "open('.env')"`, `.env`를 읽는 스크립트 실행, 그런 파일이 실제로 들어 있는 폴더에 대한 `grep -r`·`rg --hidden`·`tar`·`cp -r`·Grep 도구 |
 
 오탐을 줄이기 위해 다음은 **통과**시킵니다: 이름만 비슷한 형제 경로(`C:\Secrets2`, `C:\Secrets.txt`), `allow` 예외, 커밋 메시지·`echo`의 상대 이름, 상위 디렉토리의 비재귀 조회(`ls ..`), 상위 디렉토리로 복사·이동(`cp -r dist ..`), 제한 경로를 언급만 하는 파일을 읽기(`cat notes.md`), URL.
 
@@ -74,12 +75,36 @@ claude --plugin-dir "C:\Users\admin\Documents\claude-code-directory-block-window
 - `allow`는 **같은 파일**의 제한 경로 안에 있는 예외에만 적용됩니다.
 - 변경은 다음 도구 호출부터 바로 적용됩니다 (재시작 불필요). 전체 예시: [config/directory-block.example.json](plugins/directory-block/config/directory-block.example.json)
 
+### 파일 이름 패턴 (`restrictedPatterns`)
+
+특정 경로가 아니라 **어느 폴더에 있든** 이름이 맞는 파일·폴더를 막습니다. 문법은 `.gitignore`와 비슷합니다.
+
+```json
+{
+  "restrictedPatterns": [
+    ".env",
+    ".env.*",
+    "!.env.example",
+    "*.pem",
+    { "pattern": "certs/*.key", "reason": "TLS 키" }
+  ]
+}
+```
+
+- `*`, `?`, `[abc]`, `{a,b}`, `**`를 쓸 수 있고 대소문자는 구분하지 않습니다. 슬래시가 있는 패턴(`certs/*.key`)도 어느 위치에서든 일치합니다. `C:/data/**/*.csv`처럼 절대 경로로 쓰면 그 아래에서만 적용됩니다.
+- `!`로 시작하면 예외입니다 (`!.env.example`). 폴더 이름이 일치하면 그 안 전체가 보호됩니다.
+- 셸 명령에서는 **실제로 존재하는 파일**(또는 `>`로 쓰려는 대상)일 때만 차단합니다. 그래서 코드 속 `process.env` 같은 표현이나 커밋 메시지는 막지 않습니다. 파일 도구(Read/Write/Edit)는 존재 여부와 관계없이 막습니다.
+- **재귀 읽기**(`grep -r`, `rg`, `tar`, `zip`, `cp -r`, `Get-ChildItem -Recurse | Select-String`, Grep 도구)는 대상 폴더 아래에 일치하는 파일이 **실제로 있을 때만** 막습니다. `--exclude='.env*'`, `--include='*.ts'`, `rg -g '!.env'`, Grep 도구의 `glob` 같은 필터로 제외하면 통과합니다. `rg`는 기본적으로 숨김 파일을 건너뛰므로 `.env`가 있어도 통과합니다 (Grep 도구는 숨김 파일도 읽으므로 검사합니다). `node_modules`, `.git`은 탐색하지 않습니다.
+- Glob 도구는 파일 이름만 돌려주므로 패턴의 영향을 받지 않습니다.
+- 프로젝트 설정 파일에서도 패턴을 추가할 수 있습니다.
+
 | 옵션 | 기본값 | 설명 |
 |---|---|---|
 | `onViolation` | `"deny"` | `"ask"`면 차단 대신 사용자에게 확인. 자체 보호 위반·검증 불가 인코딩은 항상 deny |
 | `scanScripts` | `true` | 명령이 실행하는 스크립트·`package.json`·`Makefile` 내용 검사 |
 | `maxScriptBytes` / `maxScriptDepth` | `1048576` / `3` | 스크립트당 읽는 최대 바이트, 중첩 검사 깊이 |
 | `checkRecursiveAncestors` | `true` | 상위 디렉토리에 대한 재귀 탐색(`grep -r`, `gci -Recurse`, `Glob **`, `Grep`) 차단. 삭제·이동은 이 옵션과 무관하게 항상 차단 |
+| `checkPatternsInRecursiveReads` | `true` | 패턴에 맞는 파일이 들어 있는 폴더의 재귀 읽기(`grep -r`, Grep 도구, 압축·복사) 차단 |
 | `encodedCommands` | `"decode"` | `decode`: 해독해서 검사, 해독 불가면 차단 · `block`: 인코딩 명령 전면 차단 · `allow`: 검사 안 함 |
 | `protectFileTools` | `true` | Read/Write/Edit/Glob/Grep 등 파일 도구에도 제한 적용 |
 | `selfProtect` | `true` | 설정 파일·감사 로그 보호 (셸: 모든 접근 차단, 파일 도구: 쓰기만 차단) |
@@ -101,7 +126,15 @@ node plugins/directory-block/scripts/cli.js add "D:\finance" --reason "재무 �
 node plugins/directory-block/scripts/cli.js check --cwd "C:\work" -- "type ..\finance\q3.xlsx"
 ```
 
-`list`, `init`, `remove`, `--allow`, `--project DIR`도 지원합니다. Claude 세션 안에서는 `/directory-block:status`로 현재 설정을 요약해 볼 수 있습니다. Claude가 이 CLI를 실행하거나 설정 파일을 고치는 것은 자체 보호로 막혀 있습니다.
+```bash
+node plugins/directory-block/scripts/cli.js add --pattern ".env.*"
+```
+
+```bash
+node plugins/directory-block/scripts/cli.js add --pattern "!.env.example"
+```
+
+`list`, `init`, `remove`(`--pattern` 포함), `--allow`, `--project DIR`도 지원합니다. Claude 세션 안에서는 `/directory-block:status`로 현재 설정을 요약해 볼 수 있습니다. Claude가 이 CLI를 실행하거나 설정 파일을 고치는 것은 자체 보호로 막혀 있습니다.
 
 ## 실제 세션에서 확인하기
 
@@ -117,6 +150,8 @@ node plugins/directory-block/scripts/cli.js check --cwd "C:\work" -- "type ..\fi
 - 경로 인자 없이 프로그램이 내부적으로 훑는 경우 (`git add -A`, 빌드 도구, 테스트 러너). 단 `rg`/`find`/`dir /s` 같은 탐색 명령은 현재 디렉토리 기준으로 검사합니다.
 - 사전에 만들어 둔 `subst` 드라이브·하드 링크, Git Bash의 `/tmp`, `/usr` 같은 가상 루트
 - MCP 서버가 제공하는 파일 도구
+- 명령에 이름이 드러나지 않게 `.env`를 읽는 도구 (`npm run dev`의 dotenv, `docker compose`, Vite 등)
+- 패턴의 재귀 읽기 검사는 명령 하나당 항목 2만 개까지만 훑고, 그 안에서 못 찾으면 통과시킵니다 (System32 규모에서 약 1초).
 
 반대로 보수적으로 막는 경우도 있습니다. 프로젝트 하위 폴더를 제한하면, 프로젝트 루트에서 하는 재귀 검색(`grep -r`, `Glob **/*`, 경로 없는 `Grep`)도 그 폴더까지 내려가므로 차단됩니다. 이때 Claude는 차단 메시지를 보고 더 좁은 경로로 다시 시도합니다. 불편하면 `checkRecursiveAncestors: false`로 끌 수 있지만, 그러면 재귀 검색으로 제한 폴더 내용이 읽힐 수 있습니다.
 

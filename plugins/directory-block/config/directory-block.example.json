@@ -6,6 +6,13 @@
     { "path": "D:\\finance", "reason": "재무 데이터 — 접근 금지" },
     { "path": "%USERPROFILE%\\Documents\\private", "reason": "개인 문서" }
   ],
+  "restrictedPatterns": [
+    ".env",
+    ".env.*",
+    "!.env.example",
+    "*.pem",
+    { "pattern": "id_rsa*", "reason": "SSH 개인 키" }
+  ],
   "allow": [
     "D:\\finance\\public"
   ],
@@ -15,6 +22,7 @@
     "maxScriptBytes": 1048576,
     "maxScriptDepth": 3,
     "checkRecursiveAncestors": true,
+    "checkPatternsInRecursiveReads": true,
     "encodedCommands": "decode",
     "protectFileTools": true,
     "selfProtect": true,

@@ -169,7 +169,7 @@ function segmentsToPath(segs) {
 }
 
 function isGlobSegment(seg) {
-  return /[*?]|\[[^\]]+\]/.test(seg);
+  return /[*?]|\[[^\]]+\]|\{[^}]*,[^}]*\}/.test(seg);
 }
 
 function literalPrefix(segs) {
@@ -183,11 +183,19 @@ function globRegex(glob) {
   let re = globCache.get(glob);
   if (re) return re;
   let src = '';
+  let braces = 0;
   for (let i = 0; i < glob.length; i++) {
     const c = glob[i];
     if (c === '*') src += '.*';
     else if (c === '?') src += '.';
-    else if (c === '[') {
+    else if (c === '{' && glob.indexOf('}', i) !== -1) {
+      braces++;
+      src += '(?:';
+    } else if (c === ',' && braces > 0) src += '|';
+    else if (c === '}' && braces > 0) {
+      braces--;
+      src += ')';
+    } else if (c === '[') {
       const end = glob.indexOf(']', i + 1);
       if (end > i + 1) {
         let body = glob.slice(i + 1, end).replace(/\\/g, '\\\\');
@@ -213,6 +221,31 @@ function globRegex(glob) {
 function segMatch(g, r) {
   if (g === r) return true;
   return isGlobSegment(g) && globRegex(g).test(r);
+}
+
+// Whether glob segments `p` (which may contain `**`) match all of `s`.
+function matchSegments(p, s) {
+  const memo = new Map();
+  const rec = (i, j) => {
+    const key = i * 4096 + j;
+    if (memo.has(key)) return memo.get(key);
+    let result;
+    if (i === p.length) result = j === s.length;
+    else if (p[i] === '**') result = rec(i + 1, j) || (j < s.length && rec(i, j + 1));
+    else result = j < s.length && segMatch(p[i], s[j]) && rec(i + 1, j + 1);
+    memo.set(key, result);
+    return result;
+  };
+  return rec(0, 0);
+}
+
+// Whether a filename pattern names `segs` or one of its parent directories (gitignore-style: a match on a
+// directory covers everything below it).
+function patternHits(patternSegs, segs) {
+  for (let end = 1; end <= segs.length; end++) {
+    if (matchSegments(patternSegs, segs.slice(0, end))) return true;
+  }
+  return false;
 }
 
 // How candidate segments `g` (possibly with glob segments) relate to restricted segments `r`:
@@ -360,11 +393,15 @@ module.exports = {
   homeDir,
   isAbsoluteLike,
   isGlobSegment,
+  listDir,
   literalPrefix,
+  matchSegments,
+  patternHits,
   probePath,
   realpathLoose,
   relate,
   resolveCandidate,
+  segmentMatches: segMatch,
   segmentsOf,
   segmentsToPath,
   toWindowsPath,

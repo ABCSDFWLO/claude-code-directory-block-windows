@@ -18,6 +18,7 @@ const DEFAULT_OPTIONS = Object.freeze({
   maxScriptBytes: 1024 * 1024,
   maxScriptDepth: 3,
   checkRecursiveAncestors: true,
+  checkPatternsInRecursiveReads: true,
   encodedCommands: 'decode',
   protectFileTools: true,
   selfProtect: true,
@@ -37,12 +38,13 @@ const ENUMS = {
 const NUMBERS = { maxScriptBytes: [0, 64 * 1024 * 1024], maxScriptDepth: [0, 10] };
 // Booleans where `true` is the stricter setting.
 const TIGHTENING_BOOLEANS = new Set([
-  'scanScripts', 'checkRecursiveAncestors', 'protectFileTools', 'selfProtect', 'protectPluginRoot', 'protectClaudeSettings',
+  'scanScripts', 'checkRecursiveAncestors', 'checkPatternsInRecursiveReads', 'protectFileTools', 'selfProtect',
+  'protectPluginRoot', 'protectClaudeSettings',
 ]);
 // Options that are not about enforcement; only the global file sets them.
 const GLOBAL_ONLY = new Set(['language', 'auditLog', 'announceToClaude']);
 
-const KNOWN_KEYS = new Set(['$schema', '$comment', 'restricted', 'allow', 'options']);
+const KNOWN_KEYS = new Set(['$schema', '$comment', 'restricted', 'restrictedPatterns', 'allow', 'options']);
 
 function claudeDir() {
   return process.env.CLAUDE_CONFIG_DIR ? win.resolve(process.env.CLAUDE_CONFIG_DIR) : win.join(P.homeDir(), '.claude');
@@ -109,6 +111,70 @@ function parseEntries(list, field, ctx) {
     out.push({ raw, path: resolved, reason });
   });
   return out;
+}
+
+// Glob segments for a gitignore-style filename pattern. Relative patterns match at any depth, with or without a
+// slash (`.env`, `*.pem`, `config/*.key`); absolute ones (`C:/data/**/*.csv`, `~/.aws/*`) match from that root.
+function patternSegments(raw, baseDir) {
+  const expanded = P.expandVars(raw.trim(), { cwd: baseDir || P.homeDir() });
+  const s = P.toWindowsPath(expanded).replace(/\/+$/, '');
+  if (P.isAbsoluteLike(s)) return P.segmentsOf(s);
+  const segs = s.replace(/^(?:\.\/)+/, '').normalize('NFC').toLowerCase().split('/').filter(Boolean);
+  if (!segs.length || segs.some((x) => x === '.' || x === '..')) return null;
+  return segs[0] === '**' ? segs : ['**', ...segs];
+}
+
+function parsePatterns(list, ctx) {
+  const positives = [];
+  const negations = [];
+  const exceptions = [];
+  if (list === undefined) return { positives, negations, exceptions };
+  if (!Array.isArray(list)) {
+    ctx.errors.push(`${ctx.file}: "restrictedPatterns" must be an array`);
+    return { positives, negations, exceptions };
+  }
+  list.forEach((item, i) => {
+    const isObject = item && typeof item === 'object' && !Array.isArray(item);
+    const raw = typeof item === 'string' ? item : isObject ? item.pattern : undefined;
+    const reason = isObject && typeof item.reason === 'string' ? item.reason : '';
+    if (typeof raw !== 'string' || !raw.trim() || raw.trim() === '!') {
+      ctx.errors.push(`${ctx.file}: restrictedPatterns[${i}] must be a pattern string or { "pattern": ..., "reason": ... }`);
+      return;
+    }
+    const negated = raw.trim().startsWith('!');
+    const text = negated ? raw.trim().slice(1) : raw.trim();
+    const segs = patternSegments(text, ctx.baseDir);
+    if (!segs) {
+      ctx.errors.push(`${ctx.file}: restrictedPatterns[${i}] "${raw}" is not a usable pattern`);
+      return;
+    }
+    if (negated) {
+      negations.push(segs);
+      exceptions.push(text);
+    } else {
+      positives.push({ raw: text, segs, reason });
+    }
+  });
+  return { positives, negations, exceptions };
+}
+
+function buildPatternRule(id, entry, source, patterns, allowEntries) {
+  return {
+    id,
+    kind: 'restricted',
+    path: null,
+    pattern: entry.raw,
+    patternSegs: entry.segs,
+    negations: patterns.negations,
+    exceptions: patterns.exceptions,
+    raw: entry.raw,
+    reason: entry.reason,
+    reasonKey: null,
+    source,
+    allow: allowEntries.flatMap((a) => pathForms(a.path).segForms),
+    segForms: [],
+    textForms: [],
+  };
 }
 
 function pathForms(p) {
@@ -237,6 +303,10 @@ function loadConfig({ projectDir, pluginRoot } = {}) {
     const allow = parseEntries(data.allow, 'allow', ctx);
     parseEntries(data.restricted, 'restricted', ctx).forEach((entry, i) => {
       rules.push(buildRule(`${src.scope}:${i}`, 'restricted', entry, src.scope, allow));
+    });
+    const patterns = parsePatterns(data.restrictedPatterns, ctx);
+    patterns.positives.forEach((entry, i) => {
+      rules.push(buildPatternRule(`${src.scope}:pattern:${i}`, entry, src.scope, patterns, allow));
     });
     options = mergeOptions(options, data.options, src, warnings);
   }

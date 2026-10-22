@@ -18,6 +18,10 @@ const TEXT = {
     'cwd-inside': () => '현재 작업 디렉토리가 제한 경로 안에 있습니다',
     protected: (v) => `보호된 directory-block 파일입니다: "${clip(v.evidence)}" (내용 확인은 Read 도구만 허용)`,
     'encoded-command': (v) => `해독·검증할 수 없는 인코딩 명령입니다: ${clip(v.evidence)}`,
+    pattern: (v) => `보호 파일입니다: ${v.resolved}`,
+    'pattern-recursive': (v) => `"${clip(v.evidence)}" 아래를 재귀적으로 읽으면 보호 파일 ${v.resolved} 까지 읽게 됩니다. `
+      + `그 파일을 제외하거나(예: grep --exclude='${v.rule.pattern}', Grep 도구의 glob "!${v.rule.pattern}") 범위를 좁히세요`,
+    patternLabel: (p) => `파일 패턴 ${p}`,
     reason: (r) => `사유: ${r}`,
     script: (p) => `(실행되는 파일 ${p} 안에서 발견)`,
     manifest: (p) => `(${p}에 정의된 스크립트에서 발견)`,
@@ -47,6 +51,10 @@ const TEXT = {
     'cwd-inside': () => 'the current working directory is inside the restricted path',
     protected: (v) => `protected directory-block file: "${clip(v.evidence)}" (only the Read tool may view it)`,
     'encoded-command': (v) => `encoded command that cannot be decoded and verified: ${clip(v.evidence)}`,
+    pattern: (v) => `protected file: ${v.resolved}`,
+    'pattern-recursive': (v) => `reading "${clip(v.evidence)}" recursively would read protected file ${v.resolved}. `
+      + `Exclude it (e.g. grep --exclude='${v.rule.pattern}', Grep tool glob "!${v.rule.pattern}") or narrow the scope`,
+    patternLabel: (p) => `file pattern ${p}`,
     reason: (r) => `reason: ${r}`,
     script: (p) => `(found in executed file ${p})`,
     manifest: (p) => `(found in scripts defined in ${p})`,
@@ -92,7 +100,7 @@ function formatReason(violations, { lang, decision }) {
   const lines = [decision === 'ask' ? t.ask : t.deny];
   for (const v of violations.slice(0, MAX_LISTED)) {
     const describe = t[v.type] || t.reference;
-    const target = v.rule ? `${v.rule.path} — ` : '';
+    const target = v.rule ? `${v.rule.pattern ? t.patternLabel(v.rule.pattern) : v.rule.path} — ` : '';
     lines.push(`• ${target}${describe(v)}${originNote(v.origin, t)}`);
     const reason = ruleReason(v.rule, lang);
     if (reason) lines.push(`  ${t.reason(reason)}`);
