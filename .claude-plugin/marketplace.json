@@ -1,0 +1,14 @@
+{
+  "name": "directory-block-marketplace",
+  "description": "Local marketplace for the directory-block plugin.",
+  "owner": {
+    "name": "directory-block"
+  },
+  "plugins": [
+    {
+      "name": "directory-block",
+      "source": "./plugins/directory-block",
+      "description": "Blocks shell commands and file tool calls that touch user-restricted directories on Windows."
+    }
+  ]
+}

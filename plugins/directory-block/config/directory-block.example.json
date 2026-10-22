@@ -1,0 +1,27 @@
+{
+  "$comment": "Copy to %USERPROFILE%\\.claude\\directory-block.json. Paths may use %VAR%, $env:VAR, ~ and / or \\.",
+  "restricted": [
+    "~\\.ssh",
+    "~\\.aws",
+    { "path": "D:\\finance", "reason": "재무 데이터 — 접근 금지" },
+    { "path": "%USERPROFILE%\\Documents\\private", "reason": "개인 문서" }
+  ],
+  "allow": [
+    "D:\\finance\\public"
+  ],
+  "options": {
+    "onViolation": "deny",
+    "scanScripts": true,
+    "maxScriptBytes": 1048576,
+    "maxScriptDepth": 3,
+    "checkRecursiveAncestors": true,
+    "encodedCommands": "decode",
+    "protectFileTools": true,
+    "selfProtect": true,
+    "protectPluginRoot": true,
+    "protectClaudeSettings": false,
+    "auditLog": true,
+    "announceToClaude": true,
+    "language": "ko"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "name": "directory-block-plugin",
+  "private": true,
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  }
+}

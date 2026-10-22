@@ -1,0 +1,11 @@
+{
+  "name": "claude-code-directory-block-windows",
+  "private": true,
+  "description": "Development workspace and local marketplace for the directory-block Claude Code plugin.",
+  "scripts": {
+    "test": "node --test \"tests/*.test.js\""
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
