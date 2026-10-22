@@ -119,6 +119,21 @@ describe('guard.js', () => {
     assert.equal(decisionOf(hook('Read', { file_path: fx.p('proj', 'src', 'app.py') }, opts)), 'deny');
   });
 
+  it('denies a filename-pattern hit and names the pattern', () => {
+    const dir = fx.p('claude-pattern');
+    write(path.join(dir, 'directory-block.json'), JSON.stringify({ restrictedPatterns: ['.env', '!.env.example'] }));
+    write(fx.p('proj', '.env'), 'API_KEY=1');
+    write(fx.p('proj', '.env.example'), 'API_KEY=');
+    const opts = { env: { CLAUDE_CONFIG_DIR: dir } };
+    const out = hook('Bash', { command: 'cat .env' }, opts);
+    assert.equal(decisionOf(out), 'deny');
+    assert.match(out.hookSpecificOutput.permissionDecisionReason, /파일 패턴 \.env/);
+    assert.equal(hook('Bash', { command: 'cat .env.example' }, opts), null);
+    const start = run(SESSION_START, { hook_event_name: 'SessionStart', cwd: fx.proj }, { CLAUDE_CONFIG_DIR: dir });
+    assert.match(start.systemMessage, /파일 패턴 1개/);
+    assert.match(start.hookSpecificOutput.additionalContext, /Exceptions \(allowed\): \.env\.example/);
+  });
+
   it('switches messages to English with language "en"', () => {
     const dir = fx.p('claude-en');
     write(path.join(dir, 'directory-block.json'), JSON.stringify({ restricted: [fx.secrets], options: { language: 'en' } }));

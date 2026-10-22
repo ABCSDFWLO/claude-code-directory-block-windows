@@ -26,6 +26,10 @@ const USAGE = `directory-block CLI
   node cli.js add <path> [--reason TEXT] [--allow] [--project DIR]
   node cli.js remove <path> [--allow] [--project DIR]
       Add or remove a restricted path (or, with --allow, an exception inside one).
+
+  node cli.js add --pattern <pattern> [--reason TEXT] [--project DIR]
+  node cli.js remove --pattern <pattern> [--project DIR]
+      Add or remove a filename pattern such as .env, .env.* or *.pem ('!.env.example' adds an exception).
 `;
 
 function parseArgs(argv) {
@@ -79,12 +83,18 @@ function cmdList(flags) {
     console.log(`  [${f.scope}] ${f.file} (${state})`);
   }
   console.log('\nRestricted paths:');
-  const restricted = config.rules.filter((r) => r.kind === 'restricted');
+  const restricted = config.rules.filter((r) => r.kind === 'restricted' && !r.pattern);
   if (!restricted.length) console.log('  (none)');
   for (const r of restricted) {
     console.log(`  [${r.source}] ${r.path}${r.reason ? `  — ${r.reason}` : ''}`);
     for (const extra of r.segForms.slice(1)) console.log(`      real path: ${extra.join('\\')}`);
   }
+  console.log('\nRestricted file patterns:');
+  const patterns = config.rules.filter((r) => r.pattern);
+  if (!patterns.length) console.log('  (none)');
+  for (const r of patterns) console.log(`  [${r.source}] ${r.pattern}${r.reason ? `  — ${r.reason}` : ''}`);
+  const exceptions = [...new Set(patterns.flatMap((r) => r.exceptions))];
+  if (exceptions.length) console.log(`  exceptions: ${exceptions.map((e) => `!${e}`).join(', ')}`);
   console.log('\nProtected (self-protection):');
   for (const r of config.rules.filter((x) => x.kind === 'protected')) console.log(`  ${r.path}  — ${ruleReason(r, 'en')}`);
   console.log('\nOptions:');
@@ -133,7 +143,34 @@ function sameEntry(entry, resolved, baseDir) {
   return Boolean(p) && p.toLowerCase() === resolved.toLowerCase();
 }
 
+function cmdPattern(args, adding) {
+  const input = typeof args.flags.pattern === 'string' ? args.flags.pattern : args._[1];
+  if (!input || !input.trim()) throw new Error(`usage: ${adding ? 'add' : 'remove'} --pattern <pattern>`);
+  const pattern = input.trim();
+  const file = targetFile(args.flags);
+  const data = loadRaw(file);
+  const list = Array.isArray(data.restrictedPatterns) ? data.restrictedPatterns : [];
+  const same = (e) => String(typeof e === 'string' ? e : e && e.pattern).trim().toLowerCase() === pattern.toLowerCase();
+  const kept = list.filter((e) => !same(e));
+  if (adding) {
+    const reason = typeof args.flags.reason === 'string' ? args.flags.reason : '';
+    kept.push(reason ? { pattern, reason } : pattern);
+    console.log(`restrictedPatterns: + ${pattern}`);
+  } else if (kept.length === list.length) {
+    console.log(`not found in restrictedPatterns: ${pattern}`);
+    return;
+  } else {
+    console.log(`restrictedPatterns: - ${pattern}`);
+  }
+  data.restrictedPatterns = kept;
+  save(file, data);
+}
+
 function cmdAddRemove(args, adding) {
+  if (args.flags.pattern) {
+    cmdPattern(args, adding);
+    return;
+  }
   const input = args._[1];
   if (!input) throw new Error(`usage: ${adding ? 'add' : 'remove'} <path>`);
   const file = targetFile(args.flags);

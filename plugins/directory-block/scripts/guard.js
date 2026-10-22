@@ -81,6 +81,8 @@ function main() {
     input: summarizeInput(input.tool_input),
     violations: violations.map((v) => ({
       path: v.rule ? v.rule.path : null,
+      pattern: v.rule && v.rule.pattern ? v.rule.pattern : undefined,
+      file: v.rule && v.rule.pattern ? v.resolved : undefined,
       kind: v.rule ? v.rule.kind : null,
       type: v.type,
       evidence: v.evidence,

@@ -1,7 +1,7 @@
 {
   "name": "directory-block",
   "displayName": "Directory Block (Windows)",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Intercepts every shell command (Bash/PowerShell) and file tool call, detects references to user-restricted directories in any Windows path spelling, including inside scripts the command runs, and blocks them automatically.",
   "keywords": ["security", "windows", "hooks", "sandbox", "directory", "guardrail"]
 }

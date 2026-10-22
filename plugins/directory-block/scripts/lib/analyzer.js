@@ -46,6 +46,10 @@ const MESSAGE_COMMANDS = new Set([
 ]);
 const MESSAGE_FLAG = /^(?:-m|--message|-message|--title|--body|--subject|--notes?)$/i;
 
+// File-name filters (`--exclude=.env*`, `-g '!*.pem'`, `-Filter *.ts`) describe files, they do not name them.
+const FILTER_FLAG = /^(?:--exclude(?:-dir)?|--include|--i?glob|-g|-exclude|-include|-filter)$/i;
+const FILTER_ASSIGN = /^(?:--exclude(?:-dir)?|--include|--i?glob)=/i;
+
 const POWERSHELL_HOSTS = new Set(['powershell', 'pwsh']);
 
 // Their quoted arguments (bash -c "...", cmd /c "...", powershell -Command "...") are whole commands.
@@ -81,6 +85,46 @@ const BASE64_TOKEN = /^[A-Za-z0-9+/_-]{16,}={0,2}$/;
 const WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit']);
 
 const MAX_BASES = 16;
+
+// Commands that read file contents; together with a recursive walk they read every file below a directory.
+const CONTENT_READERS = new Set([
+  'grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack', 'findstr', 'select-string', 'sls', 'cat', 'type', 'get-content', 'gc',
+  'head', 'tail', 'less', 'more', 'strings', 'xargs', 'sed', 'awk', 'tar', 'zip', '7z', '7za', 'robocopy', 'xcopy',
+  'rsync', 'scp', 'cp', 'copy', 'copy-item', 'cpi', 'compress-archive',
+]);
+// Searchers that skip hidden files unless told otherwise.
+const HIDDEN_SKIPPERS = new Set(['rg', 'ag']);
+const SHOW_HIDDEN_FLAG = /^(?:--hidden|-\.|-u+|--unrestricted|--no-ignore-hidden)$/;
+// Never descended into while looking for protected files below a directory.
+const SKIP_DIRS = new Set(['node_modules', '.git', '.hg', '.svn']);
+const SEARCH_BUDGET = 20000;
+const MAX_GLOB_MATCHES = 500;
+
+// File-name filters a command was given. Excludes: grep/tar --exclude(-dir), rg -g '!x', PowerShell -Exclude,
+// zip -x, 7z -x!, robocopy /xf and /xd. Includes: grep --include, rg -g 'x', PowerShell -Include and -Filter.
+function collectFilters(words, names) {
+  const excludes = [];
+  const includes = [];
+  const glob = (g) => (g.startsWith('!') ? excludes.push(g.slice(1)) : includes.push(g));
+  for (let k = 0; k < words.length; k++) {
+    const v = words[k].value;
+    const next = words[k + 1] ? words[k + 1].value : '';
+    let m;
+    if ((m = /^--exclude(?:-dir)?=(.+)$/i.exec(v))) excludes.push(m[1]);
+    else if (/^(?:--exclude(?:-dir)?|-exclude)$/i.test(v)) excludes.push(next);
+    else if ((m = /^--include=(.+)$/i.exec(v))) includes.push(m[1]);
+    else if (/^(?:--include|-include|-filter)$/i.test(v)) includes.push(next);
+    else if ((m = /^--i?glob=(.+)$/.exec(v))) glob(m[1]);
+    else if (/^(?:-g|--i?glob)$/.test(v) && next) glob(next);
+    else if ((m = /^-xr?!(.+)$/.exec(v))) excludes.push(m[1]);
+    else if (v === '-x' && names.includes('zip')) excludes.push(next);
+    else if (/^\/x[fd]$/i.test(v)) {
+      for (let j = k + 1; j < words.length && !words[j].value.startsWith('/'); j++) excludes.push(words[j].value);
+    }
+  }
+  const clean = (list) => list.filter(Boolean).map((g) => g.replace(/^.*[\\/]/, '').toLowerCase());
+  return { excludes: clean(excludes), includes: clean(includes) };
+}
 
 function isRecursiveFlag(v, names, shell) {
   if (/^--?(?:recursive|recurse)$/i.test(v)) return true;
@@ -277,6 +321,7 @@ function destinationWords(words) {
 class Analyzer {
   constructor(config, cwd, shell) {
     this.rules = config.rules;
+    this.patternRules = config.rules.filter((r) => r.patternSegs);
     this.options = config.options;
     this.cwd = cwd;
     this.shell = shell;
@@ -292,6 +337,18 @@ class Analyzer {
     if (this.seen.has(key)) return;
     this.seen.add(key);
     this.violations.push({ rule, type, evidence: String(evidence), resolved, origin });
+  }
+
+  // The violation type for a direct hit on a rule.
+  static hitType(rule) {
+    if (rule.kind === 'protected') return 'protected';
+    return rule.patternSegs ? 'pattern' : 'reference';
+  }
+
+  patternCovers(segs, rule) {
+    return P.patternHits(rule.patternSegs, segs)
+      && !rule.negations.some((n) => P.patternHits(n, segs))
+      && !this.isAllowedSegs(segs, rule);
   }
 
   // Lexical segments plus, when different, the real location behind junctions, symlinks and 8.3 names.
@@ -319,6 +376,9 @@ class Analyzer {
   // 'inside' when the path (in any of its forms) is the rule's path or below it and no allow entry covers it,
   // 'ancestor' when it is a directory above the rule's path, otherwise null.
   classify(absPath, rule) {
+    if (rule.patternSegs) {
+      return this.pathForms(absPath).some((segs) => this.patternCovers(segs, rule)) ? 'inside' : null;
+    }
     let ancestor = false;
     for (const segs of this.pathForms(absPath)) {
       for (const r of rule.segForms) {
@@ -334,22 +394,90 @@ class Analyzer {
     return P.probePath(absPath).exists;
   }
 
-  // Resolves one candidate against every base directory, records direct hits, and returns whether it names an
-  // existing path. Ancestor hits go to `ancestors` when the caller tracks them.
-  evaluate(value, bases, origin, ancestors, checkExists, word) {
-    let exists = false;
+  // Resolves one candidate against every base directory and records direct hits. Ancestor hits go to `ancestors`
+  // and existing argument paths to `found` when the caller tracks them. Filename patterns only count for paths that
+  // exist or are written to, so code such as `process.env` is not mistaken for a file.
+  evaluate(c, bases, origin, ancestors, found) {
     for (const base of bases) {
-      const abs = P.resolveCandidate(value, base);
+      const abs = P.resolveCandidate(c.value, base);
       if (!abs) continue;
-      if (checkExists && this.exists(abs)) exists = true;
+      const exists = this.exists(abs);
+      if (exists && c.arg && found) found.push({ abs, word: c.word });
       for (const rule of this.rules) {
+        if (rule.patternSegs && !exists && !c.redirect) continue;
         const rel = this.classify(abs, rule);
-        if (rel === 'inside') this.add(rule, rule.kind === 'protected' ? 'protected' : 'reference', value, abs, origin);
-        else if (rel === 'ancestor' && ancestors) ancestors.push({ rule, evidence: value, resolved: abs, word });
+        if (rel === 'inside') this.add(rule, Analyzer.hitType(rule), c.value, abs, origin);
+        else if (rel === 'ancestor' && ancestors) ancestors.push({ rule, evidence: c.value, resolved: abs, word: c.word });
       }
-      if (P.isAbsoluteLike(value)) break;
+      if (this.patternRules.length && /[*?[{]/.test(abs)) {
+        for (const hit of this.expandGlob(abs)) {
+          for (const rule of this.patternRules) {
+            if (this.classify(hit, rule) === 'inside') this.add(rule, 'pattern', c.value, hit, origin);
+          }
+        }
+      }
+      if (P.isAbsoluteLike(c.value)) break;
     }
-    return exists;
+  }
+
+  // Existing paths a wildcard path names. In bash a leading `*` or `?` does not match dotfiles.
+  expandGlob(absPath) {
+    const root = win.parse(absPath).root;
+    if (!root) return [];
+    const segs = absPath.slice(root.length).split(/[\\/]+/).filter(Boolean);
+    let frontier = [root];
+    for (const seg of segs) {
+      const next = [];
+      const glob = seg.toLowerCase();
+      for (const dir of frontier) {
+        if (!P.isGlobSegment(seg)) {
+          next.push(win.join(dir, seg));
+          continue;
+        }
+        const entries = P.listDir(dir);
+        if (!entries) continue;
+        for (const [lower, d] of entries) {
+          if (this.shell === 'bash' && lower.startsWith('.') && !glob.startsWith('.')) continue;
+          if (P.segmentMatches(glob === '**' ? '*' : glob, lower)) next.push(win.join(dir, d.name));
+          if (next.length >= MAX_GLOB_MATCHES) break;
+        }
+      }
+      frontier = next;
+      if (!frontier.length) return [];
+    }
+    return frontier.filter((p) => this.exists(p));
+  }
+
+  // Breadth-first search below `dirs` for files that a filename pattern protects. Bounded, does not follow links,
+  // and skips node_modules and VCS folders.
+  findProtectedFiles(dirs, { skipHidden = false, excludes = [], includes = [] } = {}) {
+    const hits = [];
+    const queue = dirs.map((dir) => ({ dir, root: dir }));
+    const seen = new Set();
+    let budget = SEARCH_BUDGET;
+    for (let qi = 0; qi < queue.length && hits.length < 3 && budget > 0; qi++) {
+      const { dir, root } = queue[qi];
+      const key = dir.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const entries = P.listDir(dir);
+      if (!entries) continue;
+      for (const [lower, d] of entries) {
+        if (--budget <= 0 || hits.length >= 3) break;
+        const isDir = d.isDirectory();
+        if ((isDir && SKIP_DIRS.has(lower)) || (skipHidden && lower.startsWith('.'))) continue;
+        if (excludes.some((g) => P.segmentMatches(g, lower))) continue;
+        const full = win.join(dir, d.name);
+        const segs = P.segmentsOf(full);
+        const rule = this.patternRules.find((r) => this.patternCovers(segs, r));
+        if (rule && (isDir || !includes.length || includes.some((g) => P.segmentMatches(g, lower)))) {
+          hits.push({ rule, path: full, dir: root });
+        } else if (isDir) {
+          queue.push({ dir: full, root });
+        }
+      }
+    }
+    return hits;
   }
 
   analyzeShell(command) {
@@ -371,7 +499,7 @@ class Analyzer {
     // After the word-level pass, so its original-case evidence wins the de-duplication.
     this.textScan(expanded, src);
     for (const joined of joinLiterals(expanded)) {
-      if (looksLikePath(joined, 'path')) this.evaluate(joined, state.bases, src.origin, src.wholeFile ? state.ancestors : null, false);
+      if (looksLikePath(joined, 'path')) this.evaluate({ value: joined }, state.bases, src.origin, src.wholeFile ? state.ancestors : null, null);
     }
     if (src.wholeFile) {
       const walk = state.walk || CODE_RECURSION.test(expanded);
@@ -403,7 +531,8 @@ class Analyzer {
     const push = (value, mode, arg, word) => {
       if (!value || seen.has(value)) return;
       seen.add(value);
-      if (looksLikePath(value, mode)) out.push({ value, arg, word });
+      const redirect = word >= 0 && words[word].redirect;
+      if (looksLikePath(value, mode)) out.push({ value, arg, word, redirect });
     };
     let stage = -1;
     let stageCommand = null;
@@ -418,6 +547,8 @@ class Analyzer {
         if (/[\\/]/.test(w.value)) push(w.value, 'path', false, k);
         continue;
       }
+      const prev = k > 0 ? words[k - 1].value : '';
+      if (FILTER_ASSIGN.test(w.value) || FILTER_FLAG.test(prev) || (prev === '-x' && names.includes('zip'))) continue;
       // Free text (echo, commit messages) is only checked for absolute paths, never resolved as relative ones.
       const message = !w.redirect && (MESSAGE_COMMANDS.has(stageCommand) || (k > 0 && MESSAGE_FLAG.test(words[k - 1].value)));
       for (const v of wordValues(w.value)) push(v, message ? 'absolute' : 'bare', true, k);
@@ -443,10 +574,10 @@ class Analyzer {
       || CODE_RECURSION.test(text);
 
     const ancestors = [];
-    let explicitPath = false;
-    for (const c of this.statementCandidates(words, names)) {
-      if (this.evaluate(c.value, state.bases, src.origin, ancestors, c.arg, c.word)) explicitPath = true;
-    }
+    const found = [];
+    for (const c of this.statementCandidates(words, names)) this.evaluate(c, state.bases, src.origin, ancestors, found);
+    const explicitPath = found.length > 0;
+    const destinations = destinationWords(words);
 
     if (words.some((w) => w.cmdPos && SHELL_HOSTS.has(w.name))) {
       for (const w of words) {
@@ -458,7 +589,6 @@ class Analyzer {
       state.walk = state.walk || walk;
       state.ancestors.push(...ancestors);
     } else {
-      const destinations = destinationWords(words);
       const sources = ancestors.filter((a) => !destinations.has(a.word));
       this.checkAncestors({ walk, destructive, ancestors: sources }, src);
       if (walk && !explicitPath && this.options.checkRecursiveAncestors && names.some((n) => IMPLICIT_WALKERS.has(n))) {
@@ -469,6 +599,19 @@ class Analyzer {
             }
           }
         }
+      }
+    }
+
+    // A recursive read (grep -r, rg, tar, cp -r, gci -Recurse | Select-String ...) reads every file below its
+    // directories, so it is blocked when a pattern-protected file is actually there and not excluded.
+    if (walk && this.patternRules.length && this.options.checkPatternsInRecursiveReads
+      && names.some((n) => CONTENT_READERS.has(n))) {
+      let dirs = found.filter((f) => !destinations.has(f.word) && P.listDir(f.abs)).map((f) => f.abs);
+      if (!found.length && names.some((n) => IMPLICIT_WALKERS.has(n))) dirs = state.bases;
+      const skipHidden = names.some((n) => HIDDEN_SKIPPERS.has(n)) && !words.some((w) => SHOW_HIDDEN_FLAG.test(w.value));
+      const filters = collectFilters(words, names);
+      for (const hit of this.findProtectedFiles(dirs, { skipHidden, ...filters })) {
+        this.add(hit.rule, 'pattern-recursive', hit.dir, hit.path, src.origin);
       }
     }
 
@@ -614,7 +757,7 @@ class Analyzer {
       const abs = P.resolveCandidate(filePath, this.cwd);
       for (const rule of this.rules) {
         if (abs && applies(rule) && this.classify(abs, rule) === 'inside') {
-          this.add(rule, rule.kind === 'protected' ? 'protected' : 'reference', filePath, abs, origin);
+          this.add(rule, Analyzer.hitType(rule), filePath, abs, origin);
         }
       }
     }
@@ -624,15 +767,27 @@ class Analyzer {
       if (!base) return;
       const pattern = toolName === 'Glob' && typeof input.pattern === 'string' ? P.resolveCandidate(input.pattern, base) : null;
       for (const rule of this.rules) {
-        if (rule.kind !== 'restricted') continue;
+        // Glob only returns names, so filename patterns do not apply to it.
+        if (rule.kind !== 'restricted' || (rule.patternSegs && toolName === 'Glob')) continue;
         const rel = this.classify(base, rule);
         if (rel === 'inside') {
-          this.add(rule, 'reference', shown, base, origin);
+          this.add(rule, Analyzer.hitType(rule), shown, base, origin);
         } else if (toolName === 'Grep' && rel === 'ancestor' && this.options.checkRecursiveAncestors) {
           this.add(rule, 'recursive-ancestor', shown, base, origin);
         } else if (pattern) {
           const reach = this.globReach(pattern, rule);
           if (reach) this.add(rule, reach === 'literal' ? 'reference' : 'recursive-ancestor', input.pattern, pattern, origin);
+        }
+      }
+      // Grep reads hidden files too, so a pattern-protected file below the searched folder is read unless the
+      // glob filter leaves it out.
+      if (toolName === 'Grep' && this.patternRules.length && this.options.checkPatternsInRecursiveReads
+        && !input.type && P.listDir(base)) {
+        const glob = typeof input.glob === 'string' ? input.glob.trim() : '';
+        const name = glob.replace(/^!/, '').split(/[\\/]/).pop().toLowerCase();
+        const filters = glob.startsWith('!') ? { excludes: [name] } : { includes: name ? [name] : [] };
+        for (const hit of this.findProtectedFiles([base], filters)) {
+          this.add(hit.rule, 'pattern-recursive', shown, hit.path, origin);
         }
       }
     }
